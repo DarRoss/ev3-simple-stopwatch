@@ -99,6 +99,31 @@ struct FrameBufferPixelMatrix
 	struct MonoPixelElement* pixelMatrix;
 };
 
+/**
+ * Frame buffer bit information of a given pixel inside the pixel matrix.
+ */
+struct FramePixelBitInfo
+{
+	// current pixel index inside the pixel matrix
+	int pixelIndex;
+	// the first bit of a given pixel
+	int bitStartIndex;
+	// the last bit of a given pixel
+	int bitEndIndex;
+	// index of the byte containing the first bit of a given pixel
+	int byteStartIndex;
+	// index of the first pixel bit inside a byte. this is in [0, 7]
+	int startIndexOffset;
+	// index of the byte containing the last bit in a given pixel
+	int byteEndIndex;
+	// index of the last pixel bit inside a byte. this is in [0, 7]
+	int endIndexOffset;
+	// how many char-aligned bytes the pixel spans. 0 means it spans a single byte
+	int byteRange;
+	// the index of the first bit of a given row
+	int rowStartBit;
+};
+
 struct TextFormat
 {
 	// the coordinates of the top left pixel of the top left most bit
@@ -213,8 +238,16 @@ bool nsToString(int64_t ns, char* timeStrBuf, int bufferSize)
 			int minutesToPrint = minutes % 60;
 			int hoursToPrint = minutes / 60;
 
-			snprintf(timeStrBuf, OUTPUT_SIZE, "%d:%02d:%02d.%03d", 
-				hoursToPrint, minutesToPrint, secondsToPrint, msToPrint);
+			if(hoursToPrint > 0)
+			{
+				snprintf(timeStrBuf, OUTPUT_SIZE, "%d:%02d:%02d.%03d", 
+					hoursToPrint, minutesToPrint, secondsToPrint, msToPrint);
+			}
+			else
+			{
+				snprintf(timeStrBuf, OUTPUT_SIZE, "%02d:%02d.%03d", 
+					minutesToPrint, secondsToPrint, msToPrint);
+			}
 		}
 		else
 		{
@@ -243,97 +276,111 @@ int64_t diffTimespecNs(const struct timespec after, const struct timespec before
 /////////////////////////////////////////////////////////////////////////
 
 /**
+ * Write a pixel to the frame buffer given that the pixel occupies a single byte.
+ * Param fbDest: the memory map location of the frame buffer.
+ * Param fbpm: frame buffer info + pixel matrix.
+ * Param fpbi: frame buffer bit information of a given pixel inside the pixel matrix.
+ */
+void writeFbSingleByte(
+	char* fbDest, 
+	const struct FrameBufferPixelMatrix* fbpm, 
+	const struct FramePixelBitInfo* fpbi)
+{
+	int numShifts = 7 - fpbi->endIndexOffset;
+	char mask = ((1 << fbpm->fbInfo.bitsPP) - 1) << numShifts;
+	if(fbpm->pixelMatrix[fpbi->pixelIndex].isFG)
+	{
+		// AND mask to turn pixel black
+		mask = ~mask;
+		fbDest[fpbi->byteStartIndex] &= mask;
+	}
+	else
+	{
+		// OR mask to turn pixel white
+		fbDest[fpbi->byteStartIndex] |= mask;
+	}
+}
+
+/**
+ * Write a pixel to the frame buffer given that the pixel occupies two or more bytes.
+ * Param fbDest: the memory map location of the frame buffer.
+ * Param fbpm: frame buffer info + pixel matrix.
+ * Param fpbi: frame buffer bit information of a given pixel inside the pixel matrix.
+ */
+void writeFbMultiByte(
+	char* fbDest, 
+	const struct FrameBufferPixelMatrix* fbpm, 
+	const struct FramePixelBitInfo* fpbi)
+{
+	// suffix byte: the byte containing the trailing bits of the pixel
+	int numSuffixShifts = 7 - fpbi->endIndexOffset;
+	// prefix byte: the byte containing the leading bits of the pixel
+	int numPrefixShifts = 8 - fpbi->startIndexOffset;
+	char prefixMask = (1 << numPrefixShifts) - 1;
+	char suffixMask = ~((1 << numSuffixShifts) - 1);
+	if(fbpm->pixelMatrix[fpbi->pixelIndex].isFG)
+	{
+		// AND mask to turn pixel black
+		prefixMask = ~prefixMask;
+		suffixMask = ~suffixMask;
+		fbDest[fpbi->byteStartIndex] &= prefixMask;
+		fbDest[fpbi->byteEndIndex] &= suffixMask;
+	}
+	else
+	{
+		// OR mask to turn pixel white
+		fbDest[fpbi->byteStartIndex] |= prefixMask;
+		fbDest[fpbi->byteEndIndex] |= suffixMask;
+	}
+	// the pixel occupies three or more bytes
+	if(fpbi->byteRange >= 2)
+	{
+		// fill the middle byte(s)
+		char color = fbpm->pixelMatrix[fpbi->pixelIndex].isFG ? 0x00 : 0xFF;
+		memset(&fbDest[fpbi->byteStartIndex + 1], color, fpbi->byteRange - 1);
+	}
+}
+
+/**
  * Write pixel matrix information into the memory mapped frame buffer.
  * Param fbDest: the memory map location of the frame buffer.
  * Param fbpm: frame buffer info + pixel matrix.
  */
 void writeToFrameBuffer(char* fbDest, const struct FrameBufferPixelMatrix* fbpm)
 {
-	// current pixel index
-	int index;
-	// the first bit of a given pixel
-	int bitStartIndex;
-	// the last bit of a given pixel
-	int bitEndIndex;
-	// index of the byte containing the first bit of a given pixel
-	int byteStartIndex;
-	// index of the byte containing the last bit in a given pixel
-	int byteEndIndex;
-	// index of the last bit in a byte. this is in [0, 7]
-	int endIndexOffset;
-	// how many char-aligned bytes the pixel occupies
-	int byteRange;
-	// the index of the first bit of a given row
-	int rowStartBit;
+	struct FramePixelBitInfo fpbi;
 
 	for(unsigned row = 0; row < fbpm->fbInfo.screenHeight; ++row)
 	{
-		rowStartBit = row * fbpm->fbInfo.lineLength * 8;
+		fpbi.rowStartBit = row * fbpm->fbInfo.lineLength * 8;
 		for(unsigned col = 0; col < fbpm->fbInfo.screenWidth; ++col)
 		{
 			// determine the index of this pixel in the pixel matrix
-			index = row * fbpm->fbInfo.screenWidth + col;
+			fpbi.pixelIndex = row * fbpm->fbInfo.screenWidth + col;
 			// only proceed if the pixel needs to be drawn
-			if(fbpm->pixelMatrix[index].drawFlag)
+			if(fbpm->pixelMatrix[fpbi.pixelIndex].drawFlag)
 			{
-				bitStartIndex = rowStartBit + col * fbpm->fbInfo.bitsPP;
-				bitEndIndex = rowStartBit + (col + 1) * fbpm->fbInfo.bitsPP - 1;
-				byteStartIndex = bitStartIndex / 8;
-				byteEndIndex = bitEndIndex / 8;
-				endIndexOffset = bitEndIndex % 8;
-				byteRange = byteEndIndex - byteStartIndex;
-				// the pixel occupies a single byte
-				if(byteRange == 0)
+				fpbi.bitStartIndex = fpbi.rowStartBit + col * fbpm->fbInfo.bitsPP;
+				fpbi.bitEndIndex = fpbi.rowStartBit + (col + 1) * fbpm->fbInfo.bitsPP - 1;
+				fpbi.byteStartIndex = fpbi.bitStartIndex / 8;
+				fpbi.startIndexOffset = fpbi.bitStartIndex % 8;
+				fpbi.byteEndIndex = fpbi.bitEndIndex / 8;
+				fpbi.endIndexOffset = fpbi.bitEndIndex % 8;
+				fpbi.byteRange = fpbi.byteEndIndex - fpbi.byteStartIndex;
+
+				if(fpbi.byteRange == 0)
 				{
-					int numShifts = 7 - endIndexOffset;
-					char mask = ((1 << fbpm->fbInfo.bitsPP) - 1) << numShifts;
-					if(fbpm->pixelMatrix[index].isFG)
-					{
-						// AND mask to turn pixel black
-						mask = ~mask;
-						fbDest[byteStartIndex] &= mask;
-					}
-					else
-					{
-						// OR mask to turn pixel white
-						fbDest[byteStartIndex] |= mask;
-					}
+					// the pixel occupies a single byte
+					writeFbSingleByte(fbDest, fbpm, &fpbi);
 				}
-				// the pixel occupies two or more bytes
-				// assume that the pixel does not occupy more than one row
 				else
 				{
-					// suffix byte: the byte containing the trailing bits of the pixel
-					int numSuffixShifts = 7 - endIndexOffset;
-					int startIndexOffset = bitStartIndex % 8;
-					// prefix byte: the byte containing the leading bits of the pixel
-					int numPrefixShifts = 8 - startIndexOffset;
-					char prefixMask = (1 << numPrefixShifts) - 1;
-					char suffixMask = ~((1 << numSuffixShifts) - 1);
-					if(fbpm->pixelMatrix[index].isFG)
-					{
-						// AND mask to turn pixel black
-						prefixMask = ~prefixMask;
-						suffixMask = ~suffixMask;
-						fbDest[byteStartIndex] &= prefixMask;
-						fbDest[byteEndIndex] &= suffixMask;
-					}
-					else
-					{
-						// OR mask to turn pixel white
-						fbDest[byteStartIndex] |= prefixMask;
-						fbDest[byteEndIndex] |= suffixMask;
-					}
-					// the pixel occupies three or more bytes
-					if(byteRange >= 2)
-					{
-						// fill the middle byte(s)
-						char color = fbpm->pixelMatrix[index].isFG ? 0x00 : 0xFF;
-						memset(&fbDest[byteStartIndex + 1], color, byteRange - 1);
-					}
+					// the pixel occupies two or more bytes
+					// assume that the pixel does not occupy more than one row
+					writeFbMultiByte(fbDest, fbpm, &fpbi);
 				}
 				// unset the draw flag
-				fbpm->pixelMatrix[index].drawFlag = false;
+				fbpm->pixelMatrix[fpbi.pixelIndex].drawFlag = false;
 			}
 		}
 	}
